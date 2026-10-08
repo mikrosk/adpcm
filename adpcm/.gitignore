@@ -1,0 +1,5 @@
+*.o
+rawcaudio
+rawdaudio
+timing
+hello.adpcm

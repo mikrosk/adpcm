@@ -1,7 +1,7 @@
 #
 # Makefile for adpcm and test programs
 # -------------------
-CFLAGS=-O
+CFLAGS=-O -std=gnu89
 # May need this on a sun:
 # CFLAGS=-O -I/usr/demo/SOUND
 
