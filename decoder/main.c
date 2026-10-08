@@ -2,13 +2,19 @@
  * APM decoder / player.
  *
  * Decodes IMA ADPCM files created by wav2apm.py (see its header for the
- * file layout) with Jack Jansen's adpcm_decoder(), one block at a time.
+ * file layout) block by block.
  *
- * Linux:  the decoded audio is written to <input>_decoded.wav.
- * Atari:  the decoded audio is played by the DMA sound from a double buffer
- *         in ST-RAM; the CPU decodes the next chunk into the half which has
- *         just finished playing. Statistics about the CPU load are printed
- *         at the end. Any key stops the playback.
+ * Linux:  the file is decoded with Jack Jansen's adpcm_decoder() and written
+ *         to <input>_decoded.wav.
+ * Atari:  the file is played through a double buffer in ST-RAM which is
+ *         refilled whenever the DMA has finished playing one half of it:
+ *         - CPU: decoded with adpcm_decoder() into 16-bit samples, played
+ *           by the DMA,
+ *         - DSP (-d): the file itself is played by the DMA into the DSP
+ *           (handshake mode), which decodes it and sends the samples to
+ *           the DAC (see dspdec.asm).
+ *         Statistics about the CPU load are printed at the end. Any key
+ *         stops the playback.
  */
 
 #include <stdio.h>
@@ -21,7 +27,10 @@
 #include <mint/osbind.h>
 #include <mint/falcon.h>
 #include <time.h>
+#include <unistd.h>
 #include <usound.h>
+
+#include "dspdec.p56.h"
 #endif
 
 #define APM_HEADER_SIZE		32
@@ -251,25 +260,32 @@ static int decodeToWav(Decoder* d, const char* inputName)
 
 #else	/* __MINT__ */
 
+/* DSP playback: zero-filled bytes after the end of the file to flush the DSP */
+#define DSP_FLUSH_BYTES		2048
+
 typedef struct {
-	clock_t	decodeTicks;
-	clock_t	maxChunkTicks;
-	long	chunks;
+	clock_t	fillTicks;
+	clock_t	maxFillTicks;
+	long	fills;
 	long	underruns;
 } Stats;
 
 /*
- * Decode up to blocksPerChunk blocks into dst; the rest of the chunk
- * (if the file has ended) is filled with silence.
- * Returns the number of frames decoded, -1 on error.
+ * Fill one half of the DMA buffer; whatever is not covered by the file
+ * (once it has ended) must be filled with silence.
+ * Returns the number of bytes taken from the file (0 = silence only),
+ * -1 on error.
  */
-static long fillChunk(Decoder* d, short* dst, long chunkFrames, int outChannels, Stats* stats)
-{
-	long frames = 0;
-	clock_t start = clock();
+typedef long (*FillFunc)(Decoder* d, char* dst, long bytes);
 
-	while (frames < chunkFrames) {
-		long n = decodeBlock(d, dst + frames * outChannels, outChannels);
+/* CPU playback: decode whole blocks into 16-bit stereo samples. */
+static long fillDecoded(Decoder* d, char* dst, long bytes)
+{
+	const long frameBytes = 2 * sizeof(short);
+	long frames = 0;
+
+	while ((frames + d->info.blockFrames) * frameBytes <= bytes) {
+		long n = decodeBlock(d, (short*)dst + frames * 2, 2);
 		if (n < 0)
 			return -1;
 		if (n == 0)
@@ -277,91 +293,95 @@ static long fillChunk(Decoder* d, short* dst, long chunkFrames, int outChannels,
 		frames += n;
 	}
 
-	memset(dst + frames * outChannels, 0, (chunkFrames - frames) * outChannels * sizeof(short));
-
-	start = clock() - start;
-	stats->decodeTicks += start;
-	if (start > stats->maxChunkTicks)
-		stats->maxChunkTicks = start;
-	stats->chunks++;
-
-	return frames;
+	memset(dst + frames * frameBytes, 0, bytes - frames * frameBytes);
+	return frames * frameBytes;
 }
 
-static int play(Decoder* d, int blocksPerChunk)
+/* DSP playback: copy the file as it is (decoded by the DSP). */
+static long fillRaw(Decoder* d, char* dst, long bytes)
 {
-	const ApmInfo* info = &d->info;
-	USoundSpec desired;
-	USoundSpec obtained;
-	USoundContext context;
-	SndBufPtr pointers;
-	Stats stats;
+	long n = fread(dst, 1, bytes, d->file);
+
+	if (n < bytes) {
+		if (ferror(d->file)) {
+			fprintf(stderr, "read error\n");
+			return -1;
+		}
+		memset(dst + n, 0, bytes - n);	/* decoded as silent blocks */
+	}
+	return n;
+}
+
+static long timedFill(FillFunc fill, Decoder* d, char* dst, long bytes, Stats* stats)
+{
+	clock_t start = clock();
+	long n = fill(d, dst, bytes);
+
+	start = clock() - start;
+	stats->fillTicks += start;
+	if (start > stats->maxFillTicks)
+		stats->maxFillTicks = start;
+	stats->fills++;
+
+	return n;
+}
+
+/*
+ * Current DMA play position. Buffptr() reads the position registers byte
+ * by byte, so a carry between the reads can make it return a value off by
+ * 256 bytes or more; read it until two consecutive reads are consistent.
+ */
+static char* playPosition(void)
+{
+	SndBufPtr first;
+	SndBufPtr second;
+
+	Buffptr(&first);
+	for (;;) {
+		Buffptr(&second);
+		if ((char*)second.play >= (char*)first.play
+			&& (char*)second.play - (char*)first.play < 64)
+			return (char*)second.play;
+		first = second;
+	}
+}
+
+/*
+ * Play a double buffer of 2 * halfBytes in ST-RAM, refilling each half by
+ * fill() once the DMA has left it. The playback stops when the DMA has
+ * played tailBytes of the first half which contains only silence.
+ */
+static int playBuffer(Decoder* d, FillFunc fill, long halfBytes, long tailBytes, Stats* stats)
+{
 	char* buffer;
-	short* half[2];
+	char* half[2];
 	int silent[2];
-	long chunkFrames;
-	long chunkBytes;
-	unsigned long playedFrames = 0;
-	clock_t startTicks;
-	clock_t playTicks;
 	int playing = 0;
 	int ok = 1;
 	int i;
 
-	memset(&obtained, 0, sizeof(obtained));
-	desired.frequency = info->rate;
-	desired.channels = info->channels;
-	desired.format = USoundFormatSigned16MSB;
-	desired.samples = 1024;
-
-	if (!USoundInitXbios(&desired, &obtained, &context)) {
-		fprintf(stderr, "cannot initialise the sound system\n");
-		return 0;
-	}
-
-	if (obtained.format != USoundFormatSigned16MSB) {
-		fprintf(stderr, "signed 16-bit big endian samples are not supported\n");
-		USoundDeinitXbios(&context);
-		return 0;
-	}
-	if (obtained.frequency != info->rate)
-		printf("warning: playing at %u Hz instead of %lu Hz\n", obtained.frequency, info->rate);
-
-	chunkFrames = info->blockFrames * blocksPerChunk;
-	chunkBytes = chunkFrames * obtained.channels * sizeof(short);
-
-	buffer = (char*)Mxalloc(2 * chunkBytes, MX_STRAM);
+	buffer = (char*)Mxalloc(2 * halfBytes, MX_STRAM);
 	if ((long)buffer <= 0) {
-		fprintf(stderr, "not enough ST-RAM for %ld bytes\n", 2 * chunkBytes);
-		USoundDeinitXbios(&context);
+		fprintf(stderr, "not enough ST-RAM for %ld bytes\n", 2 * halfBytes);
 		return 0;
 	}
-	half[0] = (short*)buffer;
-	half[1] = (short*)(buffer + chunkBytes);
-
-	printf("%d ch, %lu Hz, %lu frames (%lu s), block %ld B (%ld frames), "
-		"chunk %d block(s) = %ld B in ST-RAM x 2\n",
-		info->channels, info->rate, info->samples, info->samples / info->rate,
-		info->blockSize, info->blockFrames, blocksPerChunk, chunkBytes);
-	fflush(stdout);
-
-	memset(&stats, 0, sizeof(stats));
+	half[0] = buffer;
+	half[1] = buffer + halfBytes;
 
 	for (i = 0; i < 2; i++) {
-		long n = fillChunk(d, half[i], chunkFrames, obtained.channels, &stats);
+		long n = timedFill(fill, d, half[i], halfBytes, stats);
 		if (n < 0) {
-			ok = 0;
-			goto done;
+			Mfree(buffer);
+			return 0;
 		}
 		silent[i] = n == 0;
-		playedFrames += n;
 	}
 
-	Setbuffer(SR_PLAY, buffer, buffer + 2 * chunkBytes);
+	Setbuffer(SR_PLAY, buffer, buffer + 2 * halfBytes);
 	Buffoper(SB_PLA_ENA | SB_PLA_RPT);
-	startTicks = clock();
 
-	while (!silent[playing]) {
+	for (;;) {
+		char* position;
 		int current;
 
 		if (Bconstat(2)) {
@@ -370,43 +390,175 @@ static int play(Decoder* d, int blocksPerChunk)
 			break;
 		}
 
-		Buffptr(&pointers);
-		current = (char*)pointers.play < (char*)half[1] ? 0 : 1;
+		position = playPosition();
+		current = position < half[1] ? 0 : 1;
+
+		if (silent[current] && position - half[current] >= tailBytes)
+			break;
 
 		if (current != playing) {
 			/* the half which has just finished playing gets the next chunk */
-			long n = fillChunk(d, half[playing], chunkFrames, obtained.channels, &stats);
+			long n = timedFill(fill, d, half[playing], halfBytes, stats);
 			if (n < 0) {
 				ok = 0;
 				break;
 			}
 			silent[playing] = n == 0;
-			playedFrames += n;
 
-			Buffptr(&pointers);
-			if (((char*)pointers.play < (char*)half[1] ? 0 : 1) != current)
-				stats.underruns++;
+			if ((playPosition() < half[1] ? 0 : 1) != current)
+				stats->underruns++;
 
 			playing = current;
 		}
 	}
 
-	playTicks = clock() - startTicks;
 	Buffoper(0);
-
-	printf("decoded %lu frames in %ld chunks, played %lu ms\n",
-		playedFrames, stats.chunks, (unsigned long)(playTicks * 1000 / CLOCKS_PER_SEC));
-	printf("decoding+reading: %lu ms total, %lu%% of the playback time\n",
-		(unsigned long)(stats.decodeTicks * 1000 / CLOCKS_PER_SEC),
-		playTicks > 0 ? (unsigned long)(stats.decodeTicks * 100 / playTicks) : 0);
-	printf("slowest chunk: %lu ms (one chunk plays %ld ms), underruns: %ld\n",
-		(unsigned long)(stats.maxChunkTicks * 1000 / CLOCKS_PER_SEC),
-		chunkFrames * 1000 / info->rate, stats.underruns);
-
-done:
 	Mfree(buffer);
+	return ok;
+}
+
+static void printStats(const Stats* stats, clock_t playTicks, long halfBytes, long halfMs, const char* what)
+{
+	printf("played %lu ms, %s: %lu ms total (%lu%% of the playback time)\n",
+		(unsigned long)(playTicks * 1000 / CLOCKS_PER_SEC), what,
+		(unsigned long)(stats->fillTicks * 1000 / CLOCKS_PER_SEC),
+		playTicks > 0 ? (unsigned long)(stats->fillTicks * 100 / playTicks) : 0);
+	printf("buffer: 2 x %ld B (%ld ms each), slowest refill: %lu ms, underruns: %ld\n",
+		halfBytes, halfMs, (unsigned long)(stats->maxFillTicks * 1000 / CLOCKS_PER_SEC),
+		stats->underruns);
+}
+
+static int playCpu(Decoder* d, int blocksPerChunk)
+{
+	const ApmInfo* info = &d->info;
+	USoundSpec desired;
+	USoundSpec obtained;
+	USoundContext context;
+	Stats stats;
+	long halfBytes;
+	clock_t start;
+	int ok;
+
+	memset(&obtained, 0, sizeof(obtained));
+	desired.frequency = info->rate;
+	desired.channels = 2;
+	desired.format = USoundFormatSigned16MSB;
+	desired.samples = 1024;
+
+	if (!USoundInitXbios(&desired, &obtained, &context)) {
+		fprintf(stderr, "cannot initialise the sound system\n");
+		return 0;
+	}
+
+	if (obtained.format != USoundFormatSigned16MSB || obtained.channels != 2) {
+		fprintf(stderr, "16-bit stereo playback is not supported\n");
+		USoundDeinitXbios(&context);
+		return 0;
+	}
+	if (obtained.frequency != info->rate)
+		printf("warning: playing at %u Hz instead of %lu Hz\n", obtained.frequency, info->rate);
+
+	halfBytes = info->blockFrames * blocksPerChunk * 2 * sizeof(short);
+	memset(&stats, 0, sizeof(stats));
+
+	start = clock();
+	ok = playBuffer(d, fillDecoded, halfBytes, 0, &stats);
+	start = clock() - start;
+
+	printStats(&stats, start, halfBytes, info->blockFrames * blocksPerChunk * 1000 / info->rate,
+		"decoding+reading");
+
 	USoundDeinitXbios(&context);
 	return ok;
+}
+
+/* Devconnect() prescaler of the 25.175 MHz clock for the given rate, -1 if none */
+static int prescaleForRate(unsigned long rate)
+{
+	static const struct {
+		unsigned long	rate;
+		int				prescale;
+	} rates[] = {
+		{ 49170, CLK50K }, { 32780, CLK33K }, { 24585, CLK25K }, { 19668, CLK20K },
+		{ 16390, CLK16K }, { 12292, CLK12K }, {  9834, CLK10K }, {  8195, CLK8K }
+	};
+	size_t i;
+
+	for (i = 0; i < sizeof(rates) / sizeof(rates[0]); i++) {
+		if (rates[i].rate == rate)
+			return rates[i].prescale;
+	}
+	return -1;
+}
+
+static int playDsp(Decoder* d, int blocksPerChunk)
+{
+	const ApmInfo* info = &d->info;
+	const int prescale = prescaleForRate(info->rate);
+	Stats stats;
+	long halfBytes;
+	long halfMs;
+	clock_t start;
+	int ok;
+
+	if (prescale < 0) {
+		fprintf(stderr, "%lu Hz is not a Falcon frequency\n", info->rate);
+		return 0;
+	}
+
+	if (Locksnd() != 1) {
+		fprintf(stderr, "the sound system is locked\n");
+		return 0;
+	}
+	if (Dsp_Lock() != 0) {
+		fprintf(stderr, "the DSP is locked\n");
+		Unlocksnd();
+		return 0;
+	}
+
+	Sndstatus(SND_RESET);
+	Soundcmd(ADDERIN, MATIN);
+	Setmode(MODE_STEREO16);
+	Dsptristate(DSP_ENABLE, DSP_ENABLE);
+	/* the DSP reads the words at its own pace (handshake) */
+	Devconnect(DMAPLAY, DSPRECV, CLK32M, prescale, HANDSHAKE);
+	Devconnect(DSPXMIT, DAC, CLK25M, prescale, NO_SHAKE);
+
+	/*
+	 * Load the DSP program only after the matrix has been set up: the DSP
+	 * requests the first word right away and changing the connection
+	 * afterwards lets the DMA run without the handshake (at least in
+	 * Hatari).
+	 */
+	Dsp_ExecProg((char*)dspdec_p56, dspdec_p56_len / 3, Dsp_RequestUniqueAbility());
+
+	/* the DSP finds the stream start by the file header */
+	fseek(d->file, 0, SEEK_SET);
+
+	halfBytes = info->blockSize * blocksPerChunk;
+	halfMs = (info->blockFrames * blocksPerChunk) * 1000 / info->rate;
+	memset(&stats, 0, sizeof(stats));
+
+	start = clock();
+	ok = playBuffer(d, fillRaw, halfBytes,
+		halfBytes < DSP_FLUSH_BYTES ? halfBytes : DSP_FLUSH_BYTES, &stats);
+	start = clock() - start;
+
+	printStats(&stats, start, halfBytes, halfMs, "reading");
+
+	Sndstatus(SND_RESET);
+	Dsptristate(DSP_TRISTATE, DSP_TRISTATE);
+	Dsp_Unlock();
+	Unlocksnd();
+	return ok;
+}
+
+/* Keep the output on the screen when started from the desktop. */
+static void waitForKey(void)
+{
+	printf("press any key\n");
+	fflush(stdout);
+	Bconin(2);
 }
 
 #endif	/* __MINT__ */
@@ -415,13 +567,21 @@ int main(int argc, char* argv[])
 {
 	Decoder decoder;
 	int blocksPerChunk = DEFAULT_BLOCKS_PER_CHUNK;
+	int useDsp = 0;
 	const char* fileName = NULL;
 	int ok;
 	int i;
 
+#ifdef __MINT__
+	if (isatty(STDOUT_FILENO))
+		atexit(waitForKey);
+#endif
+
 	for (i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "-c") == 0 && i + 1 < argc)
 			blocksPerChunk = atoi(argv[++i]);
+		else if (strcmp(argv[i], "-d") == 0)
+			useDsp = 1;
 		else if (fileName == NULL)
 			fileName = argv[i];
 		else
@@ -429,7 +589,7 @@ int main(int argc, char* argv[])
 	}
 
 	if (fileName == NULL || blocksPerChunk < 1) {
-		fprintf(stderr, "usage: %s [-c blocks per chunk] file.apm\n", argv[0]);
+		fprintf(stderr, "usage: %s [-c blocks per chunk] [-d] file.apm\n", argv[0]);
 		return 1;
 	}
 
@@ -440,9 +600,10 @@ int main(int argc, char* argv[])
 
 #ifndef __MINT__
 	(void)blocksPerChunk;
+	(void)useDsp;
 	ok = decodeToWav(&decoder, fileName);
 #else
-	ok = play(&decoder, blocksPerChunk);
+	ok = useDsp ? playDsp(&decoder, blocksPerChunk) : playCpu(&decoder, blocksPerChunk);
 #endif
 
 	decoderClose(&decoder);

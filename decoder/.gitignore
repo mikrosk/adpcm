@@ -1,3 +1,7 @@
 *.o
 apmdec
 apmplay.ttp
+dspdec.cld
+dspdec.lod
+dspdec.p56
+dspdec.p56.h
