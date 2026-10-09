@@ -495,6 +495,7 @@ static int playDsp(Decoder* d, int blocksPerChunk)
 {
 	const ApmInfo* info = &d->info;
 	const int prescale = prescaleForRate(info->rate);
+	char ready[3];
 	Stats stats;
 	long halfBytes;
 	long halfMs;
@@ -531,6 +532,9 @@ static int playDsp(Decoder* d, int blocksPerChunk)
 	 * Hatari).
 	 */
 	Dsp_ExecProg((char*)dspdec_p56, dspdec_p56_len / 3, Dsp_RequestUniqueAbility());
+
+	/* wait until the DSP is ready for the stream before starting the DMA */
+	Dsp_DoBlock(NULL, 0, ready, 1);
 
 	/* the DSP finds the stream start by the file header */
 	fseek(d->file, 0, SEEK_SET);

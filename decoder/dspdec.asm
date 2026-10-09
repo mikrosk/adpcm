@@ -8,12 +8,17 @@
 ; arrive at the end of the previous one; read_word undoes it (the same way
 ; as NoCrew's MP2 player does).
 ;
+; Once it is set up, the DSP sends one word to the host: the DMA must not
+; be started before.
+;
 ; Registers reserved for the transmit interrupt: r7, m7.
 
 ; --------------------------------------------------------------
 ;		Equates
 ; --------------------------------------------------------------
 
+M_HSR		equ	$ffe9				; Host Status Register
+M_HTX		equ	$ffeb				; Host Transmit Data Register
 M_PCC		equ	$ffe1				; Port C Control Register
 M_PCDDR		equ	$ffe3				; Port C Data Direction Register
 M_PCD		equ	$ffe5				; Port C Data Register
@@ -66,6 +71,10 @@ _clear:
 	movec	#RING_SIZE-1,m7
 
 	jsr	setup_ssi
+
+	jclr	#1,x:<<M_HSR,*				; tell the host that the DSP is ready
+	movep	#0,x:<<M_HTX
+
 	jsr	read_header
 
 	jclr	#1,x:<channels,mono
