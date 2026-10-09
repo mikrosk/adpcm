@@ -230,7 +230,12 @@ wait_space:
 	cmp	x0,a
 	jlt	_done
 	bset	#0,x:<playing
-	andi	#$fc,mr					; start the transmit interrupt
+
+	; Start the transmit interrupt in the second time slot of a frame: data
+	; written then is sent in the first (left) slot of the next frame.
+	jclr	#2,x:<<M_SR,*				; wait for transmit frame sync
+	jset	#2,x:<<M_SR,*				; wait for the second time slot
+	andi	#$fc,mr
 _playing:
 	move	#>RING_HIGH,x0
 	cmp	x0,a
