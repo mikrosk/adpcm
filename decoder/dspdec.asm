@@ -11,7 +11,11 @@
 ; Once it is set up, the DSP sends one word to the host: the DMA must not
 ; be started before.
 ;
-; Registers reserved for the transmit interrupt: r7, m7.
+; The samples are decoded with Jack Jansen's IMA ADPCM arithmetic; the
+; differences for all step indices and codes are computed in advance.
+;
+; Registers reserved: r0, r1 (tables), r6, m6 (output ring),
+; r7, m7 (transmit interrupt).
 
 ; --------------------------------------------------------------
 ;		Equates
@@ -38,6 +42,7 @@ APM_MAGIC_LO	equ	$434d				; "CM"
 APM_HEADER_WORDS equ	16
 
 MAX_STEP_INDEX	equ	88
+NUM_CODES	equ	16
 
 ; --------------------------------------------------------------
 ;		Vectors
@@ -69,6 +74,10 @@ _clear:
 	move	#ring,r7
 	movec	#RING_SIZE-1,m6
 	movec	#RING_SIZE-1,m7
+
+	jsr	build_table
+	move	#index_table,r0
+	move	#diff_table,r1
 
 	jsr	setup_ssi
 
@@ -208,7 +217,7 @@ _skip:
 	rts
 
 ; Read the state of one channel from a block header.
-; in: r4 = channel state (step index, previous value)
+; in: r4 = channel state (step index * NUM_CODES, previous value)
 read_channel_header:
 	jsr	read_word				; previous value (signed 16 bits)
 	move	#>$008000,x0
@@ -216,7 +225,7 @@ read_channel_header:
 	sub	x0,a	(r4)+				; sign extended
 	move	a1,x:(r4)-
 	jsr	read_word				; step index << 8
-	move	#>$008000,x0				; >> 8
+	move	#>$080000,x0				; >> 4: step index * NUM_CODES
 	mpy	y0,x0,a
 	move	a1,x:(r4)
 	rts
@@ -252,19 +261,53 @@ _playing:
 _done:
 	rts
 
-; Decode one 4-bit code (Jack Jansen's IMA ADPCM arithmetic) and append
-; the sample to the output ring.
-; in:   a1 = code in bits 3..0, r4 = channel state (step index, previous value)
+; Decode one 4-bit code and append the sample to the output ring.
+; in:   a1 = code in bits 3..0, r4 = channel state (step index * NUM_CODES,
+;       previous value)
 ; out:  b1 = sample << 8
-; uses: a, b, x0, x1, y1, r0, r1, n0, n1
+; uses: a, b, x0, x1, n0, n1
 decode_nibble:
 	move	#>$f,x1
-	and	x1,a	#step_table,r1
-	move	a1,y1					; y1: code
-	move	x:(r4)+,n1				; n1: step index
-	move	y1,n0					; n0: code
-	move	x:(r1+n1),b				; b: step
+	and	x1,a	x:(r4)+,x0			; a1: code, x0: step index * NUM_CODES
+	move	a1,n0					; n0: code
+	or	x0,a	x:(r4),b			; a1: table offset, b: previous value
+	move	a1,n1
+	move	x0,a					; a: step index * NUM_CODES
+	move	x:(r1+n1),x0				; x0: difference
+	add	x0,b	x:(r0+n0),x0			; b: new value, x0: step index change
+	add	x0,a	#>32767,x0			; a: new step index * NUM_CODES
 
+	cmp	x0,b					; clamp the value to 16 bits
+	tgt	x0,b
+	move	#>-32768,x0
+	cmp	x0,b
+	tlt	x0,b
+	move	b1,x:(r4)-
+
+	move	#0,x0					; clamp the step index
+	cmp	x0,a
+	tlt	x0,a
+	move	#>MAX_STEP_INDEX*NUM_CODES,x0
+	cmp	x0,a
+	tgt	x0,a
+	move	a1,x:(r4)
+
+	rep	#8
+	lsl	b
+	move	b1,y:(r6)+
+	rts
+
+; Compute the difference for every step index and code
+; (Jack Jansen's IMA ADPCM arithmetic).
+build_table:
+	move	#step_table,r2
+	move	#diff_table,r3
+	do	#MAX_STEP_INDEX+1,_steps
+	move	x:(r2)+,x1				; x1: step
+	move	#0,r5					; r5: code
+	do	#NUM_CODES,_codes
+	move	r5,y1
+	move	x1,b					; b: step
 	tfr	b,a
 	rep	#3
 	lsr	a					; a: step >> 3
@@ -279,32 +322,14 @@ _no2:
 	jclr	#0,y1,_no1
 	add	b,a					; + step >> 2
 _no1:
-	move	x:(r4),b				; b: previous value
-	jclr	#3,y1,_add
+	jclr	#3,y1,_positive
 	neg	a
-_add:
-	add	a,b	#>32767,x0			; b: new value, clamped to 16 bits
-	cmp	x0,b
-	tgt	x0,b
-	move	#>-32768,x0
-	cmp	x0,b
-	tlt	x0,b
-	move	b1,x:(r4)-
-
-	move	#index_table,r0
-	move	x:(r4),a				; a: new step index, clamped
-	move	x:(r0+n0),x0
-	add	x0,a	#0,x0
-	cmp	x0,a
-	tlt	x0,a
-	move	#>MAX_STEP_INDEX,x0
-	cmp	x0,a
-	tgt	x0,a
-	move	a1,x:(r4)
-
-	rep	#8
-	lsl	b
-	move	b1,y:(r6)+
+_positive:
+	move	a1,x:(r3)+
+	move	(r5)+
+_codes:
+	nop
+_steps:
 	rts
 
 ; --------------------------------------------------------------
@@ -345,12 +370,14 @@ data_words	dc	0				; per block
 rx_bits		dc	0				; skewed bits for the next word
 playing		dc	0
 
-left_state	dc	0,0				; step index, previous value
+left_state	dc	0,0				; step index * NUM_CODES, previous value
 right_state	dc	0,0
 
-index_table:
-	dc	-1,-1,-1,-1,2,4,6,8
-	dc	-1,-1,-1,-1,2,4,6,8
+index_table:							; step index change * NUM_CODES
+	dc	-1*NUM_CODES,-1*NUM_CODES,-1*NUM_CODES,-1*NUM_CODES
+	dc	2*NUM_CODES,4*NUM_CODES,6*NUM_CODES,8*NUM_CODES
+	dc	-1*NUM_CODES,-1*NUM_CODES,-1*NUM_CODES,-1*NUM_CODES
+	dc	2*NUM_CODES,4*NUM_CODES,6*NUM_CODES,8*NUM_CODES
 
 step_table:
 	dc	7,8,9,10,11,12,13,14,16,17
@@ -366,6 +393,9 @@ step_table:
 	if	@cvi(*)>$0100
 	fail	'Data does not fit into the internal X memory'
 	endif
+
+	org	x:$0100					; external
+diff_table	ds	(MAX_STEP_INDEX+1)*NUM_CODES
 
 	org	y:$0400					; external, aligned to RING_SIZE
 ring	ds	RING_SIZE
